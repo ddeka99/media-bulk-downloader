@@ -1,4 +1,4 @@
-import argparse
+﻿import argparse
 import json
 import re
 import subprocess
@@ -8,6 +8,9 @@ from pathlib import Path
 
 INSTAGRAM_URL_RE = re.compile(
     r"https?://(?:www\.)?instagram\.com/(reel|p|tv)/([A-Za-z0-9_-]+)/?"
+)
+TIKTOK_VIDEO_RE = re.compile(
+    r"https?://(?:www\.)?(?:tiktokv\.com/share/video/|tiktok\.com/@[^/]+/video/)(\d+)/?"
 )
 
 MEDIA_EXTENSIONS = {
@@ -21,6 +24,8 @@ MEDIA_EXTENSIONS = {
     ".png",
     ".webp",
 }
+
+SCRIPT_NAME = "media_downloader.py"
 
 
 def now_utc():
@@ -55,6 +60,19 @@ def timestamp_to_utc(timestamp):
     return ""
 
 
+def parse_tiktok_date(value):
+    value = str(value or "").strip()
+    if not value:
+        return "", 0
+
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return value, 0
+
+    return value, int(parsed.timestamp())
+
+
 def sanitize_filename(value):
     value = str(value or "unknown").strip()
     value = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "_", value)
@@ -63,9 +81,22 @@ def sanitize_filename(value):
 
 
 def make_key(row):
-    return "instagram|{kind}|{shortcode}|{url}".format(
-        kind=str(row.get("kind", "")).strip(),
-        shortcode=str(row.get("shortcode", "")).strip(),
+    platform = row.get("platform")
+
+    if platform == "instagram":
+        return "instagram|{kind}|{shortcode}|{url}".format(
+            kind=str(row.get("kind", "")).strip(),
+            shortcode=str(row.get("shortcode", "")).strip(),
+            url=str(row.get("url", "")).strip(),
+        )
+
+    if platform == "tiktok":
+        return "tiktok|video|{video_id}".format(
+            video_id=str(row.get("video_id", "")).strip(),
+        )
+
+    return "{platform}|{url}".format(
+        platform=str(platform or "unknown").strip(),
         url=str(row.get("url", "")).strip(),
     )
 
@@ -130,11 +161,24 @@ def save_log(path, payload, source):
     )
 
 
-def resolve_json_path(value, script_dir):
+def resolve_file_path(value, script_dir):
+    candidate = Path(value).expanduser()
+
+    if candidate.is_absolute():
+        return candidate
+
+    cwd_path = Path.cwd() / candidate
+    if cwd_path.exists():
+        return cwd_path.resolve()
+
+    return (script_dir / candidate).resolve()
+
+
+def resolve_data_path(value, script_dir, default_name, glob_pattern):
     data_dir = script_dir / "data"
 
     if value:
-        candidate = Path(value)
+        candidate = Path(value).expanduser()
         candidates = [candidate]
 
         if not candidate.is_absolute():
@@ -151,33 +195,24 @@ def resolve_json_path(value, script_dir):
         print(f"ERROR: JSON file not found: {value}")
         sys.exit(1)
 
+    default_path = data_dir / default_name
+    if default_path.exists():
+        return default_path.resolve()
+
     matches = sorted(
-        data_dir.glob("liked_posts*.json"),
+        data_dir.glob(glob_pattern),
         key=lambda path: path.stat().st_mtime,
         reverse=True,
     )
 
     if not matches:
-        print(f"ERROR: No liked posts JSON found in {data_dir}")
+        print(f"ERROR: No matching JSON found in {data_dir}: {glob_pattern}")
         sys.exit(1)
 
     return matches[0].resolve()
 
 
-def resolve_file_path(value, script_dir):
-    candidate = Path(value)
-
-    if candidate.is_absolute():
-        return candidate
-
-    cwd_path = Path.cwd() / candidate
-    if cwd_path.exists():
-        return cwd_path.resolve()
-
-    return (script_dir / candidate).resolve()
-
-
-def extract_posts(json_path):
+def extract_instagram_rows(json_path):
     data = json.loads(json_path.read_text(encoding="utf-8"))
     rows_by_key = {}
 
@@ -197,7 +232,9 @@ def extract_posts(json_path):
         timestamp = record.get("timestamp", "")
 
         row = {
+            "platform": "instagram",
             "timestamp": timestamp,
+            "sort_timestamp": int(timestamp or 0),
             "timestamp_utc": timestamp_to_utc(timestamp),
             "owner_username": get_label_value(record, "Username") or "unknown",
             "kind": kind,
@@ -211,11 +248,57 @@ def extract_posts(json_path):
         key = make_key(row)
         existing = rows_by_key.get(key)
 
-        if existing is None or int(timestamp or 0) > int(existing.get("timestamp") or 0):
+        if existing is None or row["sort_timestamp"] > existing.get("sort_timestamp", 0):
             rows_by_key[key] = row
 
     rows = list(rows_by_key.values())
-    rows.sort(key=lambda row: int(row.get("timestamp") or 0), reverse=True)
+    rows.sort(key=lambda row: row.get("sort_timestamp", 0), reverse=True)
+    return rows
+
+
+def extract_tiktok_rows(json_path):
+    data = json.loads(json_path.read_text(encoding="utf-8"))
+    liked_items = (
+        data.get("Likes and Favorites", {})
+        .get("Like List", {})
+        .get("ItemFavoriteList", [])
+    )
+
+    if not isinstance(liked_items, list):
+        return []
+
+    rows_by_key = {}
+
+    for item in liked_items:
+        if not isinstance(item, dict):
+            continue
+
+        url = str(item.get("link", "")).strip()
+        match = TIKTOK_VIDEO_RE.search(url)
+
+        if not match:
+            continue
+
+        video_id = match.group(1)
+        liked_timestamp, sort_timestamp = parse_tiktok_date(item.get("date", ""))
+        row = {
+            "platform": "tiktok",
+            "timestamp": liked_timestamp,
+            "sort_timestamp": sort_timestamp,
+            "liked_timestamp": liked_timestamp,
+            "kind": "video",
+            "video_id": video_id,
+            "url": url,
+        }
+
+        key = make_key(row)
+        existing = rows_by_key.get(key)
+
+        if existing is None or sort_timestamp > existing.get("sort_timestamp", 0):
+            rows_by_key[key] = row
+
+    rows = list(rows_by_key.values())
+    rows.sort(key=lambda row: row.get("sort_timestamp", 0), reverse=True)
     return rows
 
 
@@ -248,14 +331,29 @@ def get_rate_limit_settings(total_to_download, threshold, mode):
     }
 
 
-def get_output_files(download_dir, owner, shortcode):
-    owner_dir = download_dir / owner
+def row_output_parts(row):
+    if row.get("platform") == "instagram":
+        owner = sanitize_filename(row.get("owner_username") or "unknown")
+        shortcode = sanitize_filename(row.get("shortcode") or "unknown")
+        return owner, f"{owner}_{shortcode}", f"{owner} / {shortcode}"
 
-    if not owner_dir.exists():
+    if row.get("platform") == "tiktok":
+        video_id = sanitize_filename(row.get("video_id") or "unknown")
+        return "tiktok", f"tiktok_{video_id}", f"tiktok / {video_id}"
+
+    item_id = sanitize_filename(row.get("url") or "unknown")
+    return "unknown", item_id, item_id
+
+
+def get_output_files(download_dir, row):
+    folder, stem, _ = row_output_parts(row)
+    output_dir = download_dir / folder
+
+    if not output_dir.exists():
         return []
 
     files = []
-    for path in owner_dir.glob(f"{owner}_{shortcode}*"):
+    for path in output_dir.glob(f"{stem}*"):
         if path.is_file() and path.suffix.lower() in MEDIA_EXTENSIONS:
             files.append(path)
 
@@ -302,58 +400,72 @@ def select_rows_to_download(rows, success_log, limit):
             skipped_success += 1
             continue
 
-        selected.append(row)
-
-        if limit is not None and len(selected) >= limit:
-            break
+        if limit is None or len(selected) < limit:
+            selected.append(row)
 
     return selected, skipped_success
 
 
-def success_entry(row, output_files):
-    key = make_key(row)
-    return {
-        "key": key,
-        "platform": "instagram",
+def log_common_entry(row):
+    entry = {
+        "key": make_key(row),
+        "platform": row.get("platform", ""),
         "url": row.get("url", ""),
         "kind": row.get("kind", ""),
-        "shortcode": row.get("shortcode", ""),
-        "owner_username": row.get("owner_username", ""),
-        "liked_timestamp_utc": row.get("timestamp_utc", ""),
+    }
+
+    if row.get("platform") == "instagram":
+        entry.update({
+            "shortcode": row.get("shortcode", ""),
+            "owner_username": row.get("owner_username", ""),
+            "liked_timestamp_utc": row.get("timestamp_utc", ""),
+        })
+    elif row.get("platform") == "tiktok":
+        entry.update({
+            "video_id": row.get("video_id", ""),
+            "liked_timestamp": row.get("liked_timestamp", ""),
+        })
+
+    return entry
+
+
+def success_entry(row, output_files):
+    entry = log_common_entry(row)
+    entry.update({
         "downloaded_timestamp_utc": now_utc(),
         "output_files": [str(path.as_posix()) for path in output_files],
-    }
+    })
+    return entry
 
 
 def failure_entry(row, returncode, reason, existing=None):
     existing = existing or {}
     attempt_count = int(existing.get("attempt_count") or 0) + 1
     first_failed = existing.get("first_failed_timestamp_utc") or now_utc()
-
-    return {
-        "key": make_key(row),
-        "platform": "instagram",
-        "url": row.get("url", ""),
-        "kind": row.get("kind", ""),
-        "shortcode": row.get("shortcode", ""),
-        "owner_username": row.get("owner_username", ""),
-        "liked_timestamp_utc": row.get("timestamp_utc", ""),
+    entry = log_common_entry(row)
+    entry.update({
         "first_failed_timestamp_utc": first_failed,
         "last_failed_timestamp_utc": now_utc(),
         "reason": reason,
         "returncode": returncode,
         "attempt_count": attempt_count,
-    }
+    })
+    return entry
+
+
+def cookies_path_for_row(row, paths):
+    if row.get("platform") == "instagram":
+        return paths["instagram_cookies_path"]
+
+    if row.get("platform") == "tiktok":
+        return paths["tiktok_cookies_path"]
+
+    print(f"ERROR: No cookies file configured for platform: {row.get('platform')}")
+    sys.exit(1)
 
 
 def download_rows(rows, args, paths, success_log, failure_log):
     download_dir = paths["download_dir"]
-    cookies_path = paths["cookies_path"]
-
-    if not cookies_path.exists():
-        print(f"ERROR: Cookies file not found: {cookies_path}")
-        sys.exit(1)
-
     rate = get_rate_limit_settings(
         total_to_download=len(rows),
         threshold=args.safe_threshold,
@@ -375,9 +487,9 @@ def download_rows(rows, args, paths, success_log, failure_log):
         print("Dry run only. Selected downloads:")
         for idx, row in enumerate(rows, start=1):
             print(
-                f"{idx}. {row.get('timestamp_utc')} | "
-                f"{row.get('owner_username')} | "
-                f"{row.get('shortcode')} | "
+                f"{idx}. {row.get('platform')} | "
+                f"{row.get('timestamp_utc') or row.get('liked_timestamp')} | "
+                f"{row_output_parts(row)[2]} | "
                 f"{row.get('url')}"
             )
         return
@@ -386,16 +498,20 @@ def download_rows(rows, args, paths, success_log, failure_log):
 
     for idx, row in enumerate(rows, start=1):
         key = make_key(row)
-        owner = sanitize_filename(row.get("owner_username") or "unknown")
-        shortcode = sanitize_filename(row.get("shortcode") or "unknown")
         url = row.get("url", "").strip()
+        folder, stem, label = row_output_parts(row)
+        cookies_path = cookies_path_for_row(row, paths)
 
         if not url:
             continue
 
-        print(f"[{idx}/{len(rows)}] Downloading: {owner} / {shortcode}")
+        if not cookies_path.exists():
+            print(f"ERROR: Cookies file not found: {cookies_path}")
+            sys.exit(1)
 
-        output_template = f"{owner}/{owner}_{shortcode}.%(ext)s"
+        print(f"[{idx}/{len(rows)}] Downloading: {row.get('platform')} / {label}")
+
+        output_template = f"{folder}/{stem}.%(ext)s"
         cmd = [
             "yt-dlp",
             "--cookies",
@@ -434,15 +550,15 @@ def download_rows(rows, args, paths, success_log, failure_log):
         )
 
         output = result.stdout or ""
-        media_files = get_output_files(download_dir, owner, shortcode)
+        media_files = get_output_files(download_dir, row)
         success = result.returncode == 0 and bool(media_files)
 
         if success:
             success_log["entries"][key] = success_entry(row, media_files)
             failure_log["entries"].pop(key, None)
-            save_log(paths["success_path"], success_log, "downloader_instagram.py")
-            save_log(paths["failure_path"], failure_log, "downloader_instagram.py")
-            print(f"[{idx}/{len(rows)}] OK: {owner} / {shortcode}")
+            save_log(paths["success_path"], success_log, SCRIPT_NAME)
+            save_log(paths["failure_path"], failure_log, SCRIPT_NAME)
+            print(f"[{idx}/{len(rows)}] OK: {row.get('platform')} / {label}")
         else:
             reason = extract_failure_reason(result.returncode, output, media_files)
             failure_log["entries"][key] = failure_entry(
@@ -451,21 +567,66 @@ def download_rows(rows, args, paths, success_log, failure_log):
                 reason,
                 existing=failure_log["entries"].get(key),
             )
-            save_log(paths["failure_path"], failure_log, "downloader_instagram.py")
-            print(f"[{idx}/{len(rows)}] FAILED: {owner} / {shortcode}")
+            save_log(paths["failure_path"], failure_log, SCRIPT_NAME)
+            print(f"[{idx}/{len(rows)}] FAILED: {row.get('platform')} / {label}")
             print(f"Reason: {reason}")
 
         print()
 
 
+def selected_platforms(platform):
+    if platform == "all":
+        return ["instagram", "tiktok"]
+    return [platform]
+
+
+def load_rows(args, script_dir):
+    rows = []
+    platforms = selected_platforms(args.platform)
+
+    if "instagram" in platforms:
+        json_path = resolve_data_path(
+            args.json,
+            script_dir,
+            default_name="liked_posts.json",
+            glob_pattern="liked_posts*.json",
+        )
+        print(f"Reading Instagram data: {json_path}")
+        rows.extend(extract_instagram_rows(json_path))
+
+    if "tiktok" in platforms:
+        json_path = resolve_data_path(
+            args.tiktok_json,
+            script_dir,
+            default_name="user_data_tiktok.json",
+            glob_pattern="*tiktok*.json",
+        )
+        print(f"Reading TikTok data: {json_path}")
+        rows.extend(extract_tiktok_rows(json_path))
+
+    rows.sort(key=lambda row: row.get("sort_timestamp", 0), reverse=True)
+    return rows
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="Bulk download liked Instagram reels/posts from a Meta JSON export."
+        description="Bulk download liked Instagram and TikTok media from export JSON files."
+    )
+    parser.add_argument(
+        "--platform",
+        choices=["instagram", "tiktok", "all"],
+        default="instagram",
+        help="Platform to download. Default: instagram.",
     )
     parser.add_argument(
         "--json",
         default=None,
-        help="Liked posts JSON file. Defaults to the newest liked_posts*.json in data.",
+        help="Instagram liked posts JSON file. Defaults to data/liked_posts.json.",
+    )
+    parser.add_argument(
+        "--tiktok-json",
+        default=None,
+        help="TikTok user data JSON file. Defaults to data/user_data_tiktok.json.",
     )
     parser.add_argument(
         "--cookies",
@@ -473,11 +634,16 @@ def build_parser():
         help="Instagram cookies file in Netscape format.",
     )
     parser.add_argument(
+        "--tiktok-cookies",
+        default="cookies_tiktok.txt",
+        help="TikTok cookies file in Netscape format.",
+    )
+    parser.add_argument(
         "--destination",
         "--output",
         dest="destination",
         default=None,
-        help="Folder where the instagram_download_<timestamp> folder will be created.",
+        help="Folder where the timestamped download folder will be created.",
     )
     parser.add_argument(
         "--limit",
@@ -510,6 +676,13 @@ def build_parser():
     return parser
 
 
+def download_folder_name(platform):
+    slug = timestamp_slug()
+    if platform == "all":
+        return f"media_download_{slug}"
+    return f"{platform}_download_{slug}"
+
+
 def main():
     parser = build_parser()
     args = parser.parse_args()
@@ -522,31 +695,36 @@ def main():
     logs_dir = script_dir / "logs"
     success_path = logs_dir / "success.json"
     failure_path = logs_dir / "failure.json"
-    json_path = resolve_json_path(args.json, script_dir)
-    cookies_path = resolve_file_path(args.cookies, script_dir)
 
     destination = Path(args.destination).expanduser() if args.destination else Path.cwd()
     if not destination.is_absolute():
         destination = (Path.cwd() / destination).resolve()
 
-    download_dir = destination / f"instagram_download_{timestamp_slug()}"
+    download_dir = destination / download_folder_name(args.platform)
+
+    paths = {
+        "download_dir": download_dir,
+        "instagram_cookies_path": resolve_file_path(args.cookies, script_dir),
+        "tiktok_cookies_path": resolve_file_path(args.tiktok_cookies, script_dir),
+        "success_path": success_path,
+        "failure_path": failure_path,
+    }
 
     if args.reset:
-        save_log(success_path, empty_log("downloader_instagram.py --reset"), "downloader_instagram.py")
-        save_log(failure_path, empty_log("downloader_instagram.py --reset"), "downloader_instagram.py")
+        save_log(success_path, empty_log(f"{SCRIPT_NAME} --reset"), SCRIPT_NAME)
+        save_log(failure_path, empty_log(f"{SCRIPT_NAME} --reset"), SCRIPT_NAME)
         print("Reset complete: logs/success.json and logs/failure.json were emptied.")
 
-    success_log = load_log(success_path, "downloader_instagram.py")
-    failure_log = load_log(failure_path, "downloader_instagram.py")
+    success_log = load_log(success_path, SCRIPT_NAME)
+    failure_log = load_log(failure_path, SCRIPT_NAME)
 
     removed_failures = refresh_failure_log(success_log, failure_log)
-    save_log(failure_path, failure_log, "downloader_instagram.py")
+    save_log(failure_path, failure_log, SCRIPT_NAME)
 
-    print(f"Reading: {json_path}")
-    rows = extract_posts(json_path)
+    rows = load_rows(args, script_dir)
 
     if not rows:
-        print("No Instagram URLs found.")
+        print("No supported media URLs found.")
         sys.exit(1)
 
     selected_rows, skipped_success = select_rows_to_download(
@@ -555,7 +733,7 @@ def main():
         args.limit,
     )
 
-    print(f"Found {len(rows)} unique Instagram URLs.")
+    print(f"Found {len(rows)} unique media URLs.")
     print(f"Already successful: {skipped_success}")
     if removed_failures:
         print(f"Cleaned {removed_failures} stale failure entries.")
@@ -567,15 +745,10 @@ def main():
         print("Nothing new to download.")
         return
 
-    paths = {
-        "download_dir": download_dir,
-        "cookies_path": cookies_path,
-        "success_path": success_path,
-        "failure_path": failure_path,
-    }
     download_rows(selected_rows, args, paths, success_log, failure_log)
     print("Done.")
 
 
 if __name__ == "__main__":
     main()
+

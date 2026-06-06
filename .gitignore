@@ -1,10 +1,13 @@
-__pycache__/
+﻿__pycache__/
 *.pyc
 cookies_instagram.txt
+cookies_tiktok.txt
 data/*.json
 logs/*.json
 downloads/
 instagram_download_*/
+tiktok_download_*/
+media_download_*/
 download_status.csv
 downloaded_archive.txt
 instagram_manifest.csv
